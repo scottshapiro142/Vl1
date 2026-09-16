@@ -14,7 +14,22 @@ path = "src/lib.rs"
 name = "vl1-render"
 path = "src/bin/render.rs"
 
+# Live playing needs an audio device, MIDI input and raw terminal keys. None of
+# that belongs in the synthesis library, so it is a feature and only the binary
+# that needs it pulls it in.
+[[bin]]
+name = "vl1-play"
+path = "src/bin/play.rs"
+required-features = ["live"]
+
+[features]
+default = []
+live = ["dep:cpal", "dep:midir", "dep:crossterm"]
+
 [dependencies]
+cpal = { version = "0.16", optional = true }
+midir = { version = "0.10", optional = true }
+crossterm = { version = "0.29", optional = true }
 
 [profile.release]
 opt-level = 3

@@ -33,6 +33,15 @@
 //! engine.render(&mut buffer);
 //! ```
 //!
+//! ## Playing it live
+//!
+//! With the `live` feature, `vl1-play` opens an audio device, listens to every
+//! MIDI input it can find, and also plays from the computer keyboard:
+//!
+//! ```console
+//! $ cargo run --release --features live --bin vl1-play
+//! ```
+//!
 //! ## Polyphony
 //!
 //! The hardware VL1 was two-voice: each voice cost a dedicated DSP. This engine
@@ -45,10 +54,12 @@ pub mod dsp;
 pub mod effects;
 pub mod element;
 pub mod engine;
+pub mod keymap;
 pub mod midi;
 pub mod modifier;
 pub mod patch;
 pub mod presets;
+pub mod queue;
 pub mod voice;
 pub mod wav;
 pub mod waveguide;

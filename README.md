@@ -10,7 +10,9 @@ changed the pressure across a reed, which changed how the reed beat against the
 mouthpiece, which changed the spectrum, the pitch, and whether the thing spoke at all.
 That is what this crate does.
 
-No dependencies. The DSP, the WAV writer, and the CLI are all here.
+The synthesis library has **no dependencies** — the DSP, the WAV writer and the offline
+renderer are all here. Playing it live needs an audio device, MIDI input and raw terminal
+keys, so that lives behind an optional `live` feature and nothing else has to build it.
 
 ## Architecture
 
@@ -93,6 +95,88 @@ $ cargo run --release --bin vl1-render -- --all demos/
 swell across the take, because a physical model played at constant pressure throws away
 most of what it is for.
 
+## Playing it live
+
+```console
+$ cargo run --release --features live --bin vl1-play
+$ cargo run --release --features live --bin vl1-play -- --preset Shakuhachi
+$ cargo run --release --features live --bin vl1-play -- --list
+```
+
+`vl1-play` opens the default audio device, connects to every MIDI input it can
+find, and also plays from the computer keyboard. The synthesis library itself
+stays dependency-free — audio, MIDI and terminal handling live behind the `live`
+feature, so nothing that only renders offline has to build them.
+
+On Linux you will need ALSA's development headers (`libasound2-dev` on Debian and
+Ubuntu, `alsa-lib-devel` on Fedora). macOS and Windows need nothing extra.
+
+### Computer keyboard
+
+```
+  black   2 3   5 6 7   9 0        s d   g h j
+  white  q w e r t y u i o p     z x c v b n m , . /
+         (octave above)          (current octave)
+```
+
+| Key | |
+| --- | --- |
+| `[` `]` | previous / next patch |
+| `-` `=` | octave down / up |
+| ↑ ↓ | breath pressure |
+| ← → | embouchure |
+| `1` | scream on/off |
+| `4` | growl on/off |
+| `space` | sustain pedal |
+| `8` | panic |
+| `esc` | quit |
+
+One caveat worth knowing before you try to play a chord: terminals traditionally
+report only key *presses*, and auto-repeat applies to the most recent key alone,
+so a held chord decays to its last note. `vl1-play` requests the kitty keyboard
+protocol, and where the terminal supports it (kitty, foot, WezTerm, Ghostty,
+recent xterm) you get real key-release events and proper polyphonic playing.
+Elsewhere it falls back to releasing a note shortly after its auto-repeat stops,
+which plays melodies correctly but not sustained chords. It says which mode it
+got on startup. For chords, use MIDI.
+
+### MIDI
+
+Every input port is connected by default (`--midi-port N` picks one,
+`--no-midi` ignores them all). Notes, velocity, pitch bend and channel
+aftertouch all work, and the controller map is the wind-controller layout the
+VL1 was built around:
+
+| CC | Control |
+| --- | --- |
+| 1 | vibrato depth |
+| 2 | breath pressure |
+| 3 | embouchure |
+| 7 / 11 | volume / expression |
+| 16 | scream |
+| 17 | growl |
+| 18 | damping |
+| 19 | absorption |
+| 64 | sustain |
+
+A breath controller on CC2 is what this engine is really for: pressure is not a
+volume knob here, it is the thing the whole model is solved around.
+
+### How the realtime side is put together
+
+The audio callback owns one `Engine` per factory patch, so switching patches is
+an index change rather than an allocation. The keyboard thread and each MIDI
+callback hand it commands through `vl1::queue`, a lock-free SPSC ring of `Copy`
+values. Nothing on the audio thread locks, allocates or frees.
+
+If you have no sound card — a container, a CI box — `--selftest` drives that
+whole path with the device removed, so you can tell a broken engine apart from a
+broken audio setup:
+
+```console
+$ cargo run --release --features live --bin vl1-play -- --selftest
+```
+
 ## Factory patches
 
 Each patch declares the key range over which it has been *verified* to speak and stay in
@@ -166,7 +250,12 @@ $ cargo test --release
 Covers: every patch speaks, stays bounded, and holds pitch across its declared range;
 notes release to silence; the pool stays at eight voices under a ninth note; the sustain
 pedal holds and releases; MIDI drives the engine; and every control pushed to its limit
-at once on every patch never produces a non-finite or out-of-range sample.
+at once on every patch never produces a non-finite or out-of-range sample. The keyboard
+map and the lock-free queue are tested too — the queue against a live concurrent
+producer.
+
+The parts that need real hardware (the audio device, MIDI ports, terminal key handling)
+are not unit-testable; `vl1-play --selftest` covers everything behind them.
 
 Pitch is measured with YIN rather than plain autocorrelation — breath noise and bow
 scratch make a correlation peak-picker return whatever the shortest allowed lag is,
