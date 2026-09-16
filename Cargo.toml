@@ -1,0 +1,22 @@
+[package]
+name = "vl1"
+version = "0.1.0"
+edition = "2021"
+description = "An 8-voice virtual acoustic (physical modelling) synthesizer inspired by the Yamaha VL1"
+license = "MIT"
+readme = "README.md"
+
+[lib]
+name = "vl1"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vl1-render"
+path = "src/bin/render.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
