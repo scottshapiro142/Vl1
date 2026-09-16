@@ -3,7 +3,7 @@
 use crate::control::Controls;
 use crate::dsp::Smoother;
 use crate::element::Element;
-use crate::patch::{Patch, PortamentoMode};
+use crate::patch::{Patch, PerformancePatch, PortamentoMode};
 
 /// Per-voice state. The engine owns a fixed pool of these.
 pub struct Voice {
@@ -92,9 +92,15 @@ impl Voice {
             .fold(0.0, f32::max)
     }
 
-    pub fn note_on(&mut self, note: u8, velocity: f32, age: u64, patch: &Patch) {
+    /// Start a note.
+    ///
+    /// Takes the performance settings by value rather than the whole patch: this
+    /// runs on the audio thread for every note-on, and `Patch` owns a `String`,
+    /// so passing it by reference to a caller that has to clone it first means a
+    /// malloc and a free per note.
+    pub fn note_on(&mut self, note: u8, velocity: f32, age: u64, performance: PerformancePatch) {
         let legato = self.active && self.is_held();
-        let glide = match patch.performance.portamento {
+        let glide = match performance.portamento {
             PortamentoMode::Off => false,
             PortamentoMode::Always => self.active,
             PortamentoMode::Legato => legato,

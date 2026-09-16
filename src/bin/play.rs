@@ -12,7 +12,7 @@
 
 use std::error::Error;
 use std::io::{stdout, Write};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -64,6 +64,8 @@ struct Args {
     midi_port: Option<usize>,
     no_midi: bool,
     buffer: Option<u32>,
+    sample_rate: Option<u32>,
+    gain_db: f32,
 }
 
 fn usage() -> &'static str {
@@ -76,7 +78,9 @@ OPTIONS:
     --preset <NAME>   Factory patch to start on (default: Tenor Sax)
     --midi-port <N>   Connect only to this MIDI input (default: all of them)
     --no-midi         Computer keyboard only
-    --buffer <FRAMES> Audio buffer size; smaller is tighter but riskier
+    --buffer <FRAMES> Audio buffer size; raise it if the audio breaks up
+    --sr <HZ>         Ask the device for this sample rate
+    --gain <DB>       Output trim, e.g. -6 to stay clear of the limiter
     --list            List audio devices, MIDI inputs and patches, then exit
     --selftest        Exercise the control path without an audio device
     -h, --help        Show this help
@@ -91,6 +95,8 @@ fn parse_args() -> Result<Args, String> {
         midi_port: None,
         no_midi: false,
         buffer: None,
+        sample_rate: None,
+        gain_db: 0.0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -105,6 +111,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "--no-midi" => args.no_midi = true,
             "--buffer" => args.buffer = Some(value()?.parse::<u32>().map_err(|e| e.to_string())?),
+            "--sr" => args.sample_rate = Some(value()?.parse::<u32>().map_err(|e| e.to_string())?),
+            "--gain" => args.gain_db = value()?.parse::<f32>().map_err(|e| e.to_string())?,
             "--list" => args.list = true,
             "--selftest" => args.selftest = true,
             "-h" | "--help" => {
@@ -123,6 +131,30 @@ fn parse_args() -> Result<Args, String> {
 
 struct Shared {
     active_voices: AtomicU8,
+    /// Callback time as a fraction of the block's wall-clock budget, in
+    /// thousandths. Over 1000 means the callback took longer than the audio it
+    /// produced, which is a dropout.
+    load: AtomicU32,
+    peak_load: AtomicU32,
+    /// Blocks that missed their deadline.
+    xruns: AtomicU32,
+    /// Peak level before the limiter, in thousandths. Over 1000 is saturation.
+    peak: AtomicU32,
+    /// Frames per callback, as the device actually delivers them.
+    block: AtomicU32,
+}
+
+impl Shared {
+    fn new() -> Self {
+        Self {
+            active_voices: AtomicU8::new(0),
+            load: AtomicU32::new(0),
+            peak_load: AtomicU32::new(0),
+            xruns: AtomicU32::new(0),
+            peak: AtomicU32::new(0),
+            block: AtomicU32::new(0),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +172,8 @@ struct Mixer {
     active: usize,
     from_keys: Consumer<Command>,
     from_midi: Consumer<Command>,
+    /// Output trim, so a player can back off the limiter without editing patches.
+    gain: f32,
 }
 
 impl Mixer {
@@ -167,9 +201,11 @@ impl Mixer {
 
     /// Render one block, mapping the stereo pair onto the device's channels.
     fn fill<T: SizedSample + cpal::FromSample<f32>>(&mut self, out: &mut [T], channels: usize) {
+        let gain = self.gain;
         let engine = &mut self.engines[self.active];
         for frame in out.chunks_mut(channels) {
             let [l, r] = engine.tick();
+            let (l, r) = (l * gain, r * gain);
             for (i, slot) in frame.iter_mut().enumerate() {
                 // A mono device gets the sum; anything past stereo is fed the
                 // stereo pair and then silence.
@@ -187,6 +223,10 @@ impl Mixer {
     fn active_voices(&self) -> usize {
         self.engines[self.active].active_voices()
     }
+
+    fn take_peak(&mut self) -> f32 {
+        self.engines[self.active].take_peak()
+    }
 }
 
 fn build_stream<T>(
@@ -199,12 +239,36 @@ fn build_stream<T>(
 where
     T: SizedSample + cpal::FromSample<f32>,
 {
+    let sample_rate = config.sample_rate.0 as f64;
+
     device.build_output_stream(
         config,
         move |out: &mut [T], _: &cpal::OutputCallbackInfo| {
+            let started = Instant::now();
+
             // Drain control input first, so this block reflects it.
             mixer.drain();
             mixer.fill(out, channels);
+
+            // How much of this block's real-time budget the work consumed.
+            // Anything near 100% will crackle, and the player deserves to be
+            // told that rather than left guessing at their audio settings.
+            let frames = (out.len() / channels.max(1)) as f64;
+            shared.block.store(frames as u32, Ordering::Relaxed);
+            let budget = frames / sample_rate;
+            let load = if budget > 0.0 {
+                (started.elapsed().as_secs_f64() / budget * 1000.0) as u32
+            } else {
+                0
+            };
+            shared.load.store(load, Ordering::Relaxed);
+            shared.peak_load.fetch_max(load, Ordering::Relaxed);
+            if load >= 1000 {
+                shared.xruns.fetch_add(1, Ordering::Relaxed);
+            }
+            shared
+                .peak
+                .store((mixer.take_peak() * 1000.0) as u32, Ordering::Relaxed);
             shared
                 .active_voices
                 .store(mixer.active_voices() as u8, Ordering::Relaxed);
@@ -230,6 +294,7 @@ fn selftest() -> Result<(), Box<dyn Error>> {
         active: 0,
         from_keys: key_rx,
         from_midi: midi_rx,
+        gain: 1.0,
     };
 
     let mut out = vec![0.0f32; 1024];
@@ -372,7 +437,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     )?;
     // A "default device" can exist and still be unusable — a container with no
     // sound card reports one. Say so in terms the player can act on.
-    let supported = device.default_output_config().map_err(|e| {
+    let mut supported = device.default_output_config().map_err(|e| {
         format!(
             "the default audio device (`{}`) could not be opened ({e}).\n\
              Run `vl1-play --list` to see what this machine reports; on a \
@@ -380,6 +445,29 @@ fn run() -> Result<(), Box<dyn Error>> {
             device.name().unwrap_or_else(|_| "<unnamed>".into())
         )
     })?;
+    // A device's default rate can be far higher than anything this needs; at
+    // 192 kHz the engine does four times the work per second of audio for no
+    // musical gain, so allow asking for something saner.
+    if let Some(want) = args.sample_rate {
+        let rate = cpal::SampleRate(want);
+        let found = device
+            .supported_output_configs()
+            .map(|configs| {
+                configs
+                    .filter(|c| c.min_sample_rate() <= rate && rate <= c.max_sample_rate())
+                    .map(|c| c.with_sample_rate(rate))
+                    .next()
+            })
+            .unwrap_or(None);
+        match found {
+            Some(config) => supported = config,
+            None => eprintln!(
+                "note: this device does not offer {want} Hz; using {} Hz",
+                supported.sample_rate().0
+            ),
+        }
+    }
+
     let sample_rate = supported.sample_rate().0 as f32;
     let channels = supported.channels() as usize;
 
@@ -399,11 +487,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         active: start,
         from_keys: key_rx,
         from_midi: midi_rx,
+        gain: vl1::dsp::db_to_gain(args.gain_db),
     };
 
-    let shared = Arc::new(Shared {
-        active_voices: AtomicU8::new(0),
-    });
+    let shared = Arc::new(Shared::new());
 
     let stream = match supported.sample_format() {
         SampleFormat::F32 => build_stream::<f32>(&device, &config, channels, mixer, shared.clone()),
@@ -437,6 +524,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     // --- Terminal ----------------------------------------------------------
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "WARNING: this is a debug build. The synthesis is roughly twenty times\n\
+             slower than a release build and the audio will break up badly.\n\
+             Rebuild with:  cargo run --release --features live --bin vl1-play\n"
+        );
+    }
+
     println!(
         "vl1 — {} | {:.0} Hz, {} ch | {} voices",
         patches[start].name,
@@ -481,6 +576,7 @@ fn connect_midi(
     let tx = Arc::new(Mutex::new(tx));
     let mut connections = Vec::new();
     let mut names = Vec::new();
+    let mut skipped = Vec::new();
 
     for (i, port) in ports.iter().enumerate() {
         if only.is_some_and(|want| want != i) {
@@ -488,6 +584,16 @@ fn connect_midi(
         }
         let input = midir::MidiInput::new("vl1")?;
         let name = input.port_name(port).unwrap_or_else(|_| "<unnamed>".into());
+
+        // Skip echo ports unless one was asked for by number. A "Through" port
+        // re-emits whatever arrives on it, so connecting to both it and the
+        // real port delivers every note twice — which retriggers each note a
+        // few milliseconds after it starts and sounds like a stutter.
+        if only.is_none() && name.to_lowercase().contains("through") {
+            skipped.push(format!("{i}: {name} (echo port)"));
+            continue;
+        }
+
         let tx = tx.clone();
 
         let connection = input.connect(
@@ -507,14 +613,55 @@ fn connect_midi(
     }
 
     if connections.is_empty() {
-        return Err("requested MIDI port does not exist".into());
+        return Err(if skipped.is_empty() {
+            "requested MIDI port does not exist".into()
+        } else {
+            "the only MIDI ports available are echo ports; \
+             pass --midi-port N to use one anyway"
+                .to_string()
+        }
+        .into());
+    }
+    for note in skipped {
+        names.push(format!("{note} — skipped"));
     }
     Ok((connections, names))
 }
 
-/// How long a held key is assumed to still be held, when the terminal cannot
-/// report key releases. Auto-repeat refreshes it well inside this window.
-const KEY_HOLD: Duration = Duration::from_millis(220);
+/// A key the computer keyboard is holding down.
+struct HeldKey {
+    key: char,
+    note: u8,
+    /// When this key was last seen, either pressed or auto-repeated.
+    seen: Instant,
+    /// Auto-repeats observed so far.
+    repeats: u32,
+}
+
+impl HeldKey {
+    /// How long to keep sounding after the last event for this key, when the
+    /// terminal cannot report releases.
+    ///
+    /// Auto-repeat has two phases and they are an order of magnitude apart: the
+    /// first repeat comes after the system's initial delay, typically 250-600 ms,
+    /// and subsequent ones every 30-50 ms. One fixed window cannot serve both —
+    /// short enough to release promptly and it cuts every note off before its
+    /// first repeat even arrives, which is heard as the note stuttering.
+    fn hold(&self) -> Duration {
+        if self.repeats == 0 {
+            // Still waiting for the first repeat: outlast any sane initial delay.
+            Duration::from_millis(900)
+        } else {
+            // Repeating steadily now, so silence means the key really is up.
+            Duration::from_millis(180)
+        }
+    }
+
+    /// Whether this key should be released, given the time now.
+    fn expired(&self, now: Instant) -> bool {
+        now.duration_since(self.seen) > self.hold()
+    }
+}
 
 fn keyboard_loop(
     mut tx: Producer<Command>,
@@ -569,8 +716,8 @@ fn keyboard_loop_inner(
     let mut growl = 0u8;
     let mut sustain = false;
 
-    // Notes started from the computer keyboard: (key, midi note, last seen).
-    let mut held: Vec<(char, u8, Instant)> = Vec::new();
+    // Notes started from the computer keyboard.
+    let mut held: Vec<HeldKey> = Vec::new();
     let mut last_status = Instant::now() - Duration::from_secs(1);
 
     let mut send = |tx: &mut Producer<Command>, msg: &[u8]| {
@@ -585,8 +732,8 @@ fn keyboard_loop_inner(
                 TermEvent::Key(key) => {
                     if matches!(key.kind, KeyEventKind::Release) {
                         if let KeyCode::Char(c) = key.code {
-                            if let Some(pos) = held.iter().position(|(k, _, _)| *k == c) {
-                                let (_, note, _) = held.remove(pos);
+                            if let Some(pos) = held.iter().position(|h| h.key == c) {
+                                let note = held.remove(pos).note;
                                 send(tx, &[0x80, note, 0]);
                             }
                         }
@@ -598,8 +745,8 @@ fn keyboard_loop_inner(
                         || (key.code == KeyCode::Char('c')
                             && key.modifiers.contains(KeyModifiers::CONTROL))
                     {
-                        for (_, note, _) in held.drain(..) {
-                            send(tx, &[0x80, note, 0]);
+                        for h in held.drain(..) {
+                            send(tx, &[0x80, h.note, 0]);
                         }
                         let _ = tx.push(Command::Panic);
                         return Ok(());
@@ -629,9 +776,9 @@ fn keyboard_loop_inner(
         // been let go.
         if !precise {
             let now = Instant::now();
-            held.retain(|(_, note, seen)| {
-                if now.duration_since(*seen) > KEY_HOLD {
-                    if let Some(cmd) = Command::midi(&[0x80, *note, 0]) {
+            held.retain(|h| {
+                if h.expired(now) {
+                    if let Some(cmd) = Command::midi(&[0x80, h.note, 0]) {
                         let _ = tx.push(cmd);
                     }
                     false
@@ -644,8 +791,25 @@ fn keyboard_loop_inner(
         if last_status.elapsed() > Duration::from_millis(80) {
             last_status = Instant::now();
             let voices = shared.active_voices.load(Ordering::Relaxed);
+            let load = shared.load.load(Ordering::Relaxed);
+            let peak_load = shared.peak_load.load(Ordering::Relaxed);
+            let xruns = shared.xruns.load(Ordering::Relaxed);
+            let peak = shared.peak.load(Ordering::Relaxed);
+            let block = shared.block.load(Ordering::Relaxed);
+
+            // `lim` means the output limiter is saturating: distortion, not a
+            // dropout. `xrun` means the callback missed its deadline: a
+            // dropout, not distortion. Telling those apart by ear is hard, and
+            // the fixes are opposite.
+            let flags = match (peak > 1000, xruns > 0) {
+                (true, true) => "lim xrun",
+                (true, false) => "lim     ",
+                (false, true) => "    xrun",
+                (false, false) => "        ",
+            };
             print!(
-                "\r  {:<13} oct {:<2} breath {:>3} emb {:>3} scream {:>3} growl {:>3} {} voices {}   ",
+                "\r  {:<12} oct {:<2} br {:>3} emb {:>3} scr {:>3} grw {:>3} {} | {} voices  \
+                 cpu {:>3}% (max {:>3}%)  buf {:<5} peak {:>4}  {}   ",
                 patches[preset].name,
                 octave,
                 breath,
@@ -653,7 +817,12 @@ fn keyboard_loop_inner(
                 scream,
                 growl,
                 if sustain { "sus" } else { "   " },
-                voices
+                voices,
+                load / 10,
+                peak_load / 10,
+                block,
+                peak,
+                flags,
             );
             let _ = stdout().flush();
         }
@@ -665,7 +834,7 @@ fn handle_key(
     key: KeyEvent,
     tx: &mut Producer<Command>,
     send: &mut impl FnMut(&mut Producer<Command>, &[u8]),
-    held: &mut Vec<(char, u8, Instant)>,
+    held: &mut Vec<HeldKey>,
     octave: &mut i32,
     preset: &mut usize,
     breath: &mut u8,
@@ -685,12 +854,18 @@ fn handle_key(
     match key.code {
         KeyCode::Char(c) if keymap::is_note_key(c) => {
             if let Some(note) = keymap::note(c, *octave) {
-                if let Some(entry) = held.iter_mut().find(|(k, _, _)| *k == c) {
+                if let Some(entry) = held.iter_mut().find(|h| h.key == c) {
                     // Auto-repeat of a key that is still down: refresh, do not
                     // retrigger, or holding a note would machine-gun it.
-                    entry.2 = Instant::now();
+                    entry.seen = Instant::now();
+                    entry.repeats += 1;
                 } else {
-                    held.push((c, note, Instant::now()));
+                    held.push(HeldKey {
+                        key: c,
+                        note,
+                        seen: Instant::now(),
+                        repeats: 0,
+                    });
                     send(tx, &[0x90, note, 100]);
                 }
             }
@@ -742,5 +917,65 @@ fn handle_key(
             send(tx, &[0xB0, cc::SUSTAIN, if *sustain { 127 } else { 0 }]);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn held(repeats: u32, age_ms: u64) -> HeldKey {
+        HeldKey {
+            key: 'z',
+            note: 60,
+            seen: Instant::now() - Duration::from_millis(age_ms),
+            repeats,
+        }
+    }
+
+    #[test]
+    fn a_key_survives_the_initial_auto_repeat_delay() {
+        // The bug this guards against: a hold window shorter than the system's
+        // initial key-repeat delay releases every note before its first repeat
+        // arrives, so a held note stutters instead of sustaining.
+        let now = Instant::now();
+        assert!(!held(0, 300).expired(now));
+        assert!(!held(0, 600).expired(now));
+        assert!(!held(0, 850).expired(now));
+    }
+
+    #[test]
+    fn a_key_released_before_any_repeat_still_stops() {
+        assert!(held(0, 1000).expired(Instant::now()));
+    }
+
+    #[test]
+    fn a_repeating_key_releases_promptly() {
+        // Once repeats are arriving every 30-50 ms, a long gap means key-up.
+        let now = Instant::now();
+        assert!(!held(5, 60).expired(now));
+        assert!(!held(5, 150).expired(now));
+        assert!(held(5, 250).expired(now));
+    }
+
+    #[test]
+    fn midi_commands_carry_their_length() {
+        match Command::midi(&[0x90, 60, 100]).unwrap() {
+            Command::Midi { bytes, len } => {
+                assert_eq!(len, 3);
+                assert_eq!(&bytes[..3], &[0x90, 60, 100]);
+            }
+            other => panic!("expected a MIDI command, got {other:?}"),
+        }
+        // Two-byte messages (program change, channel pressure) round-trip too.
+        match Command::midi(&[0xD0, 64]).unwrap() {
+            Command::Midi { bytes, len } => {
+                assert_eq!(len, 2);
+                assert_eq!(&bytes[..2], &[0xD0, 64]);
+            }
+            other => panic!("expected a MIDI command, got {other:?}"),
+        }
+        assert!(Command::midi(&[]).is_none());
+        assert!(Command::midi(&[0xF0, 1, 2, 3]).is_none());
     }
 }

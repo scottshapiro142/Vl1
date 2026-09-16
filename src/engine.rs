@@ -21,6 +21,8 @@ pub struct Engine {
     sample_rate: f32,
     counter: u64,
     master: f32,
+    /// Largest magnitude seen before the output limiter since it was last read.
+    peak: f32,
 }
 
 impl Engine {
@@ -42,6 +44,7 @@ impl Engine {
             reverb: Reverb::new(sample_rate),
             sample_rate,
             counter: 0,
+            peak: 0.0,
         };
         engine.chorus.configure(&engine.patch.chorus);
         engine.reverb.configure(&engine.patch.reverb);
@@ -101,8 +104,8 @@ impl Engine {
         self.counter += 1;
         let age = self.counter;
         let index = self.allocate(note);
-        let patch = self.patch.clone();
-        self.voices[index].note_on(note, velocity as f32 / 127.0, age, &patch);
+        let performance = self.patch.performance;
+        self.voices[index].note_on(note, velocity as f32 / 127.0, age, performance);
     }
 
     pub fn note_off(&mut self, note: u8) {
@@ -156,6 +159,14 @@ impl Engine {
         self.controls.pitch_bend = bend.clamp(-1.0, 1.0);
     }
 
+    /// The largest magnitude that reached the output limiter since the last
+    /// call, and resets the measurement. Above 1.0 the limiter is working, so a
+    /// host can show the player that what they hear is saturation rather than a
+    /// dropout.
+    pub fn take_peak(&mut self) -> f32 {
+        std::mem::replace(&mut self.peak, 0.0)
+    }
+
     /// Render one stereo sample pair.
     #[inline]
     pub fn tick(&mut self) -> [f32; 2] {
@@ -174,6 +185,7 @@ impl Engine {
 
         // Eight independent waveguides can sum well past full scale; a soft
         // limiter keeps that musical instead of letting it wrap or clip hard.
+        self.peak = self.peak.max(mix[0].abs()).max(mix[1].abs());
         [crate::dsp::soft_clip(mix[0]), crate::dsp::soft_clip(mix[1])]
     }
 

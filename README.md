@@ -162,6 +162,33 @@ VL1 was built around:
 A breath controller on CC2 is what this engine is really for: pressure is not a
 volume knob here, it is the thing the whole model is solved around.
 
+### If it sounds bad
+
+Choppy and distorted are different faults with opposite fixes, and they are hard
+to tell apart by ear, so the status line names them:
+
+```
+  Tenor Sax    oct 4  br 100 emb  64 ... | 3 voices  cpu   7% (max  21%)  buf 256   peak  412
+```
+
+- **`xrun`** — the audio callback missed its deadline. That is a dropout: clicks,
+  gaps, stuttering. Raise `--buffer` (try 512 or 1024). Check `cpu`: the engine
+  uses under 10% of a 256-frame budget on a modern core, so a high reading means
+  something else is wrong — almost always a **debug build**. Use `--release`;
+  debug is roughly twenty times slower and cannot keep up.
+- **`lim`** — the output limiter is saturating. That is distortion, not a
+  dropout, and a bigger buffer will not help. Pull the level down with
+  `--gain -6`, or play fewer notes at once.
+- Neither flag, but notes **stutter or double-strike**: something is retriggering
+  them. From the computer keyboard in a terminal without key-release reporting,
+  a held note is kept alive by auto-repeat, which is inherently uneven. Over
+  MIDI, check the startup banner for more than one connected port — a controller
+  exposed twice delivers every note twice. `--midi-port N` picks one.
+
+`--selftest` renders the whole control path with no audio device, so if it
+reports every patch `ok` the synthesis is fine and the problem is in the audio
+configuration.
+
 ### How the realtime side is put together
 
 The audio callback owns one `Engine` per factory patch, so switching patches is
