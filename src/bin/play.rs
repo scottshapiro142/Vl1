@@ -471,40 +471,85 @@ fn run() -> Result<(), Box<dyn Error>> {
     let sample_rate = supported.sample_rate().0 as f32;
     let channels = supported.channels() as usize;
 
+    // Left to itself, a host can hand out a buffer of several thousand frames —
+    // PulseAudio and PipeWire routinely do — which is a tenth of a second of
+    // latency before a single sample of synthesis happens. Ask for something
+    // playable and fall back if the device refuses.
+    const DEFAULT_BUFFER: u32 = 256;
     let mut config: cpal::StreamConfig = supported.clone().into();
-    if let Some(frames) = args.buffer {
-        config.buffer_size = cpal::BufferSize::Fixed(frames);
-    }
-
-    let (key_tx, key_rx) = queue::channel::<Command>(256);
-    let (midi_tx, midi_rx) = queue::channel::<Command>(256);
-
-    let mixer = Mixer {
-        engines: patches
-            .iter()
-            .map(|p| Engine::with_patch(p.clone(), sample_rate))
-            .collect(),
-        active: start,
-        from_keys: key_rx,
-        from_midi: midi_rx,
-        gain: vl1::dsp::db_to_gain(args.gain_db),
+    let wanted = args.buffer.unwrap_or(DEFAULT_BUFFER);
+    config.buffer_size = match supported.buffer_size() {
+        cpal::SupportedBufferSize::Range { min, max } => {
+            cpal::BufferSize::Fixed(wanted.clamp(*min, *max))
+        }
+        cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Fixed(wanted),
     };
 
     let shared = Arc::new(Shared::new());
+    let gain = vl1::dsp::db_to_gain(args.gain_db);
 
-    let stream = match supported.sample_format() {
-        SampleFormat::F32 => build_stream::<f32>(&device, &config, channels, mixer, shared.clone()),
-        SampleFormat::I16 => build_stream::<i16>(&device, &config, channels, mixer, shared.clone()),
-        SampleFormat::U16 => build_stream::<u16>(&device, &config, channels, mixer, shared.clone()),
-        other => return Err(format!("unsupported sample format {other:?}").into()),
+    // Building the stream consumes the queue's reading ends, so a failed
+    // attempt cannot be retried with the same ones. Each attempt gets a fresh
+    // pair; nothing has sent to them yet, since MIDI and the keyboard start
+    // further down.
+    let open = |config: &cpal::StreamConfig| -> Result<
+        (cpal::Stream, Producer<Command>, Producer<Command>),
+        cpal::BuildStreamError,
+    > {
+        let (key_tx, key_rx) = queue::channel::<Command>(256);
+        let (midi_tx, midi_rx) = queue::channel::<Command>(256);
+        let mixer = Mixer {
+            engines: patches
+                .iter()
+                .map(|p| Engine::with_patch(p.clone(), sample_rate))
+                .collect(),
+            active: start,
+            from_keys: key_rx,
+            from_midi: midi_rx,
+            gain,
+        };
+        let stream = match supported.sample_format() {
+            SampleFormat::F32 => {
+                build_stream::<f32>(&device, config, channels, mixer, shared.clone())
+            }
+            SampleFormat::I16 => {
+                build_stream::<i16>(&device, config, channels, mixer, shared.clone())
+            }
+            SampleFormat::U16 => {
+                build_stream::<u16>(&device, config, channels, mixer, shared.clone())
+            }
+            _ => Err(cpal::BuildStreamError::StreamConfigNotSupported),
+        }?;
+        Ok((stream, key_tx, midi_tx))
+    };
+
+    if !matches!(
+        supported.sample_format(),
+        SampleFormat::F32 | SampleFormat::I16 | SampleFormat::U16
+    ) {
+        return Err(format!("unsupported sample format {:?}", supported.sample_format()).into());
     }
-    .map_err(|e| {
-        format!(
-            "could not open an audio stream on `{}` ({e}).\n\
-             Run `vl1-play --list` to see what this machine reports.",
-            device.name().unwrap_or_else(|_| "<unnamed>".into())
-        )
-    })?;
+
+    let (stream, key_tx, midi_tx) = match open(&config) {
+        Ok(opened) => opened,
+        Err(first) => {
+            // Some devices refuse a fixed buffer outright. Playing with whatever
+            // the host wants to give beats not playing at all.
+            eprintln!(
+                "note: this device would not take a {wanted}-frame buffer ({first}); \
+                 using its own, which may add latency"
+            );
+            config.buffer_size = cpal::BufferSize::Default;
+            open(&config).map_err(|e| {
+                format!(
+                    "could not open an audio stream on `{}` ({e}).\n\
+                     Run `vl1-play --list` to see what this machine reports.",
+                    device.name().unwrap_or_else(|_| "<unnamed>".into())
+                )
+            })?
+        }
+    };
+
     stream
         .play()
         .map_err(|e| format!("audio device accepted the stream but would not start it ({e})"))?;
@@ -532,6 +577,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         );
     }
 
+    let buffered_ms = match config.buffer_size {
+        cpal::BufferSize::Fixed(frames) => frames as f32 / sample_rate * 1000.0,
+        cpal::BufferSize::Default => f32::NAN,
+    };
     println!(
         "vl1 — {} | {:.0} Hz, {} ch | {} voices",
         patches[start].name,
@@ -539,6 +588,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         channels,
         vl1::POLYPHONY
     );
+    if buffered_ms.is_finite() {
+        println!("audio buffer: {:.1} ms (--buffer to change)", buffered_ms);
+    }
     if midi_names.is_empty() {
         println!("MIDI: none connected");
     } else {

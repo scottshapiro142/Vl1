@@ -63,6 +63,7 @@ pub fn clarinet() -> Patch {
     e.driver.breath_noise = 0.015;
     e.driver.tonguing = 0.55;
     e.driver.tongue_time = 0.018;
+    e.driver.attack_impulse = 2.0;
     e.driver.throat_freq = 1100.0;
     e.driver.throat_amount = 0.15;
 
@@ -102,6 +103,7 @@ pub fn tenor_sax() -> Patch {
     e.driver.embouchure_env = 0.1;
     e.driver.breath_noise = 0.05;
     e.driver.tonguing = 0.45;
+    e.driver.attack_impulse = 2.5;
     e.driver.growl_rate = 28.0;
     e.driver.growl_depth = 0.35;
     e.driver.throat_freq = 900.0;
@@ -164,6 +166,7 @@ pub fn trumpet() -> Patch {
     e.driver.breath_noise = 0.02;
     e.driver.tonguing = 0.6;
     e.driver.tongue_time = 0.012;
+    e.driver.attack_impulse = 2.0;
 
     e.pipe.mode = PipeMode::AllHarmonics;
     e.pipe.damping_hz = 3800.0;
@@ -215,6 +218,7 @@ pub fn trombone() -> Patch {
 
     e.driver.embouchure = 0.08;
     e.driver.embouchure_key_track = 0.25;
+    e.driver.attack_impulse = 2.0;
     e.driver.lip_q = 4.5;
     e.pipe.damping_hz = 2800.0;
     e.pipe.absorption = 0.976;
@@ -234,7 +238,7 @@ pub fn trombone() -> Patch {
 pub fn flute() -> Patch {
     let mut p = Patch::default();
     p.name = "Flute".into();
-    p.performance.key_range = (36, 79);
+    p.performance.key_range = (36, 74);
     let e = &mut p.element;
 
     e.driver.kind = DriverKind::Jet;
@@ -243,6 +247,7 @@ pub fn flute() -> Patch {
     e.driver.breath_noise = 0.18;
     e.driver.noise_tracking = 0.8;
     e.driver.tonguing = 0.35;
+    e.driver.attack_impulse = 1.5;
     e.driver.throat_freq = 2000.0;
     e.driver.throat_amount = 0.25;
 
@@ -319,6 +324,7 @@ pub fn violin() -> Patch {
     e.driver.breath_noise = 0.012;
     e.driver.noise_tracking = 1.0;
     e.driver.tonguing = 0.0;
+    e.driver.attack_impulse = 2.5;
 
     e.pipe.mode = PipeMode::AllHarmonics;
     e.pipe.damping_hz = 4200.0;
@@ -403,6 +409,7 @@ pub fn scream_lead() -> Patch {
     e.driver.growl_rate = 22.0;
     e.driver.growl_depth = 0.5;
     e.driver.tonguing = 0.5;
+    e.driver.attack_impulse = 2.0;
 
     e.pipe.mode = PipeMode::AllHarmonics;
     e.pipe.damping_hz = 4200.0;
@@ -451,6 +458,7 @@ pub fn breath_pad() -> Patch {
     let e = &mut p.element;
     e.driver.kind = DriverKind::Jet;
     e.driver.jet_ratio = 0.38;
+    e.driver.attack_impulse = 0.5;
     e.driver.breath_noise = 0.3;
     e.driver.embouchure = 0.45;
     e.driver.throat_freq = 1600.0;

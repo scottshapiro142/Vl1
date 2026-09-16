@@ -170,6 +170,42 @@ fn every_preset_plays_in_tune_across_its_range() {
 }
 
 #[test]
+fn every_preset_speaks_promptly() {
+    // A waveguide near its oscillation threshold can take the better part of a
+    // second to grow out of the noise floor, which is heard as latency however
+    // small the audio buffer is. The articulation transient at note-on is what
+    // prevents that, and this is the test that would catch it going missing.
+    for patch in presets::all() {
+        let name = patch.name.clone();
+        // A patch is allowed to be slow only as far as its own envelope asks:
+        // the pad swells deliberately, the sax does not.
+        let budget_ms = patch.element.breath.attack * 2000.0 + 30.0;
+
+        let samples = render_note(patch, 60, 1.5, 0.0);
+        let steady = samples[(1.0 * SR) as usize..]
+            .iter()
+            .fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(steady > 0.0, "{name}: never sounded at all");
+
+        let mut follower = 0.0f32;
+        let mut spoke = None;
+        for (i, s) in samples.iter().enumerate() {
+            follower = s.abs().max(follower * 0.9995);
+            if follower >= steady * 0.5 {
+                spoke = Some(i as f32 / SR * 1000.0);
+                break;
+            }
+        }
+
+        let spoke = spoke.expect("envelope never reached half of its own steady level");
+        assert!(
+            spoke <= budget_ms,
+            "{name}: took {spoke:.0} ms to speak, budget {budget_ms:.0} ms"
+        );
+    }
+}
+
+#[test]
 fn notes_release_to_silence() {
     for patch in presets::all() {
         let name = patch.name.clone();

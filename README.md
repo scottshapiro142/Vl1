@@ -162,6 +162,35 @@ VL1 was built around:
 A breath controller on CC2 is what this engine is really for: pressure is not a
 volume knob here, it is the thing the whole model is solved around.
 
+### If it feels laggy
+
+Two unrelated things add delay, and they are worth separating:
+
+**The audio buffer.** Shown at startup and in the status line. `vl1-play` asks
+for 256 frames (about 5 ms at 48 kHz) rather than accepting the host default,
+which on PulseAudio or PipeWire can be thousands of frames. `--buffer` changes
+it; smaller is tighter until it starts costing you `xrun`s.
+
+**How long the instrument takes to speak.** This one is peculiar to physical
+modelling. A waveguide does not start at full amplitude — the oscillation grows
+at a rate set by how far the driver's gain exceeds the loop's losses, and a patch
+voiced close to its threshold can take *half a second* to become audible. No
+audio setting will fix that, because it is the instrument, not the software.
+
+What fixes it is the same thing that fixes it on a real instrument: an
+articulation. `attack_impulse` injects a single half-cycle pulse at the played
+pitch into the resonator at note-on — the tongue releasing, the bow biting — so
+the loop starts with a body of energy instead of amplifying its own noise floor.
+Every playable patch here speaks within about 4 ms, and `tests/engine.rs` holds
+them to it.
+
+The pulse is pitched rather than broadband on purpose. A click excites every
+mode of the tube at once, and a cylindrical bore answers by jumping to its third
+mode — which is a clarinet overblowing to the twelfth. Correct behaviour for a
+clarinet, wrong note for a synthesiser, and with a noise burst which way it went
+depended on the noise. Too much `attack_impulse` still overblows: the value in
+each patch sits below where its own register breaks, measured across its range.
+
 ### If it sounds bad
 
 Choppy and distorted are different faults with opposite fixes, and they are hard
@@ -179,6 +208,8 @@ to tell apart by ear, so the status line names them:
 - **`lim`** — the output limiter is saturating. That is distortion, not a
   dropout, and a bigger buffer will not help. Pull the level down with
   `--gain -6`, or play fewer notes at once.
+- Neither flag, but everything feels **late**: see the section above — audio
+  buffer and speaking time are different problems.
 - Neither flag, but notes **stutter or double-strike**: something is retriggering
   them. From the computer keyboard in a terminal without key-release reporting,
   a held note is kept alive by auto-repeat, which is inherently uneven. Over
@@ -217,7 +248,7 @@ you playing outside one, but the model may break register or fail to start.
 | Tenor Sax | Reed | all harmonics | C2–C6 | −13 c |
 | Trumpet | Lip | all harmonics | C2–D5 | −15 c |
 | Trombone | Lip | all harmonics | C2–E4 | −14 c |
-| Flute | Jet | all harmonics | C2–G5 | −13 c |
+| Flute | Jet | all harmonics | C2–D5 | −13 c |
 | Shakuhachi | Jet | all harmonics | C2–C5 | −13 c |
 | Violin | Bow | all harmonics | C2–C5 | −6 c |
 | Cello | Bow | all harmonics | C2–C5 | +5 c |

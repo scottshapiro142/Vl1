@@ -26,6 +26,14 @@ pub struct DriverPatch {
     pub tonguing: f32,
     /// Duration of that tongue stroke, seconds.
     pub tongue_time: f32,
+    /// Energy injected into the resonator at note-on, 0..1.
+    ///
+    /// A real instrument is started by a transient — the tongue releasing, the
+    /// bow biting, the lip buzzing — which hands the resonator a body of energy
+    /// immediately. Without one the oscillation has to grow out of the noise
+    /// floor at a rate set by how far the driver exceeds the loop's losses,
+    /// which near threshold takes hundreds of milliseconds and is felt as lag.
+    pub attack_impulse: f32,
     /// Chaotic-regime drive, 0..1.
     pub scream: f32,
     /// Turbulence level at the excitation point.
@@ -69,6 +77,7 @@ impl Default for DriverPatch {
             embouchure_env: 0.0,
             tonguing: 0.0,
             tongue_time: 0.02,
+            attack_impulse: 3.0,
             scream: 0.0,
             breath_noise: 0.02,
             noise_tracking: 1.0,

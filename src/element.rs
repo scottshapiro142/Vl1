@@ -42,6 +42,20 @@ pub struct Element {
     tongue: f32,
     tongue_coef: f32,
 
+    /// Articulation transient: position within the pulse, in samples, and its
+    /// length. Negative position means no pulse is in flight.
+    ///
+    /// The pulse is a single half-cycle of a sine at the played pitch, which is
+    /// what the resonator is being asked to sustain anyway. Filtered noise was
+    /// the obvious thing to inject here and it is the wrong thing: broadband
+    /// energy excites every mode of the tube at once, and a cylindrical bore
+    /// answers by jumping to its third mode — a clarinet overblowing to the
+    /// twelfth. Faithful, but not the note anyone asked for, and which way it
+    /// went depended on the noise. A single smooth pulse has almost no energy
+    /// up there, so the register is decided by the patch rather than by luck.
+    strike_pos: f32,
+    strike_len: f32,
+
     /// Base pitch in Hz before vibrato and bend, set by the voice.
     freq: f32,
     tuned_freq: f32,
@@ -68,6 +82,8 @@ impl Element {
             embouchure: Smoother::new(0.01, sample_rate),
             tongue: 0.0,
             tongue_coef: 0.99,
+            strike_pos: -1.0,
+            strike_len: 1.0,
             freq: 261.63,
             tuned_freq: 0.0,
             counter: 0,
@@ -149,6 +165,7 @@ impl Element {
         self.pressure.set_immediate(0.0);
         self.embouchure.set_immediate(self.patch.driver.embouchure);
         self.tongue = 0.0;
+        self.strike_pos = -1.0;
         self.drive = 0.0;
         self.tuned_freq = 0.0;
     }
@@ -169,6 +186,9 @@ impl Element {
             self.growl.reset(0.0);
         }
         self.tongue = self.patch.driver.tonguing.clamp(0.0, 1.0);
+        if !legato && self.patch.driver.attack_impulse > 0.0 {
+            self.strike_pos = 0.0;
+        }
     }
 
     pub fn note_off(&mut self) {
@@ -260,7 +280,25 @@ impl Element {
         let injected = self.driver.tick(&input);
 
         // --- Resonator -------------------------------------------------------
-        let mut sig = self.guide.tick(injected);
+        // The articulation transient goes straight into the tube, where it
+        // excites every mode at once and the loop immediately has something to
+        // work with instead of amplifying its own noise floor for half a second.
+        let excite = if self.strike_pos >= 0.0 {
+            if self.strike_pos == 0.0 {
+                // Half a period of the note being played.
+                self.strike_len = (0.5 * self.sample_rate / self.freq.max(1.0)).max(2.0);
+            }
+            let phase = self.strike_pos / self.strike_len;
+            self.strike_pos += 1.0;
+            if self.strike_pos > self.strike_len {
+                self.strike_pos = -1.0;
+            }
+            (phase * std::f32::consts::PI).sin() * d.attack_impulse * b.level * velocity
+        } else {
+            0.0
+        };
+
+        let mut sig = self.guide.tick(injected + excite);
         if patch.pipe.tap_mix.abs() > 1e-4 {
             sig += self.guide.tap(patch.pipe.tap_position) * patch.pipe.tap_mix;
         }
